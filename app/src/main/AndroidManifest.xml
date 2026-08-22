@@ -15,6 +15,10 @@
         android:name="android.permission.WRITE_SECURE_SETTINGS"
         tools:ignore="ProtectedPermissions" />
 
+    <queries>
+        <package android:name="com.miui.voiceassist" />
+    </queries>
+
     <application
         android:label="@string/app_name"
         android:allowBackup="false"

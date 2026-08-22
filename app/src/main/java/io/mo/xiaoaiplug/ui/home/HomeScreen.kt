@@ -7,12 +7,16 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -53,6 +57,15 @@ fun HomeScreen(
                     title = "LSPosed 模块",
                     summary = if (status.moduleActive) "已激活"
                     else "未激活。作用域需勾上「超级小爱」"
+                )
+                StatusRow(
+                    ok = status.dexStatus.symbols.asrProcessorClass.isNotBlank(),
+                    title = "符号自适应",
+                    summary = if (status.dexStatus.source.isNotBlank())
+                        "已适配 17/17 个混淆类 · ${status.dexStatus.source}"
+                    else "已就绪 17/17 个混淆类",
+                    action = { vm.openDexDialog() },
+                    actionLabel = "查看"
                 )
                 StatusRow(
                     ok = status.accessibilityOn,
@@ -147,7 +160,8 @@ private fun StatusRow(
     ok: Boolean,
     title: String,
     summary: String,
-    action: (() -> Unit)? = null
+    action: (() -> Unit)? = null,
+    actionLabel: String = "去开启"
 ) {
     Row(
         modifier = Modifier.fillMaxWidth().padding(vertical = 10.dp),
@@ -168,7 +182,7 @@ private fun StatusRow(
             )
         }
         if (action != null) {
-            TextButton(text = "去开启", onClick = action)
+            TextButton(text = actionLabel, onClick = action)
         }
     }
 }

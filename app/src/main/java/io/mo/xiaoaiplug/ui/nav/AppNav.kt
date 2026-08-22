@@ -54,6 +54,9 @@ fun AppRoot() {
     // 所以设置页那边 showToast 一下，这里就能显示出来。
     val vm: ConfigViewModel = viewModel()
     val toast by vm.toast.collectAsStateWithLifecycle()
+    val showDexDialog by vm.showDexDialog.collectAsStateWithLifecycle()
+    val isScanningDex by vm.isScanningDex.collectAsStateWithLifecycle()
+    val status by vm.status.collectAsStateWithLifecycle()
 
     val updateVm: UpdateViewModel = viewModel()
     val pendingUpdate by updateVm.pending.collectAsStateWithLifecycle()
@@ -119,6 +122,16 @@ fun AppRoot() {
                 backdrop = backdrop,
                 onDismiss = { updateVm.dismiss() },
                 onUpdate = { updateVm.openDownload() }
+            )
+
+            // 符号自适应弹窗同样在 layerBackdrop 外面，安全采样应用背景，避免图层环形依赖闪退
+            io.mo.xiaoaiplug.ui.home.DexSymbolsDialog(
+                visible = showDexDialog,
+                dexStatus = status.dexStatus,
+                backdrop = backdrop,
+                isScanning = isScanningDex,
+                onRescan = { vm.rescanDexSymbols() },
+                onDismiss = { vm.closeDexDialog() }
             )
         }
     }

@@ -181,4 +181,64 @@ object ConfigClient {
             false
         }
     }
+
+    fun reportDexSymbols(
+        context: Context?,
+        symbolsJson: String,
+        durationMs: Long,
+        source: String,
+        appVersion: String
+    ): Boolean {
+        if (context == null) return false
+        val extras = Bundle().apply {
+            putString("symbols_json", symbolsJson)
+            putLong("duration", durationMs)
+            putString("source", source)
+            putString("app_version", appVersion)
+        }
+        return try {
+            val out = context.contentResolver.call(uri, ConfigProvider.METHOD_REPORT_DEX_SYMBOLS, null, extras)
+            out?.getBoolean("ok") == true
+        } catch (t: Throwable) {
+            false
+        }
+    }
+
+    fun readDexSymbols(context: Context): DexStatusInfo {
+        val result: Bundle = try {
+            context.contentResolver.call(uri, ConfigProvider.METHOD_GET, null, null)
+        } catch (t: Throwable) {
+            null
+        } ?: return DexStatusInfo()
+
+        val jsonStr = result.getString(ConfigKeys.DEX_SYMBOLS_JSON).orEmpty()
+        val symbols = if (jsonStr.isNotBlank()) {
+            runCatching {
+                io.mo.xiaoaiplug.hook.dex.TargetSymbols.fromJson(org.json.JSONObject(jsonStr))
+            }.getOrDefault(io.mo.xiaoaiplug.hook.dex.TargetSymbols())
+        } else {
+            io.mo.xiaoaiplug.hook.dex.TargetSymbols()
+        }
+        val duration = result.getString(ConfigKeys.DEX_SYMBOLS_DURATION)?.toLongOrNull() ?: 0L
+        val source = result.getString(ConfigKeys.DEX_SYMBOLS_SOURCE).orEmpty()
+        val time = result.getString(ConfigKeys.DEX_SYMBOLS_TIME)?.toLongOrNull() ?: 0L
+        val appVersion = result.getString(ConfigKeys.DEX_APP_VERSION).orEmpty()
+
+        return DexStatusInfo(
+            symbols = symbols,
+            durationMs = duration,
+            source = source,
+            time = time,
+            appVersion = appVersion
+        )
+    }
 }
+
+data class DexStatusInfo(
+    val symbols: io.mo.xiaoaiplug.hook.dex.TargetSymbols = io.mo.xiaoaiplug.hook.dex.TargetSymbols(),
+    val durationMs: Long = 0L,
+    val source: String = "",
+    val time: Long = 0L,
+    val appVersion: String = ""
+)
+

@@ -17,6 +17,16 @@ android {
         targetSdk = 36
         versionCode = 6
         versionName = "1.0.6"
+
+        ndk {
+            abiFilters.addAll(listOf("arm64-v8a"))
+        }
+    }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
     }
 
     buildTypes {
@@ -50,6 +60,7 @@ kotlin {
 
 dependencies {
     compileOnly(libs.xposed.api)
+    implementation(libs.dexkit)
 
     implementation(platform(libs.compose.bom))
     implementation(libs.compose.ui)
@@ -73,3 +84,4 @@ dependencies {
     // 是全项目最不该被悄悄改坏的一段,必须有回归保护。
     testImplementation(libs.junit)
 }
+

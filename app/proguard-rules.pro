@@ -26,4 +26,8 @@
 # 反射目标(小爱、系统设置的类)不在本 APK 内,R8 管不着,也无需 keep。
 # 配置读写走 org.json 手写解析,没有基于字段名的反射序列化,不用保字段名。
 
+# ——— DexKit 动态 Dex 搜索 ———
+-keep class org.luckypray.dexkit.** { *; }
+-dontwarn org.luckypray.dexkit.**
+
 -dontwarn org.jetbrains.annotations.**

@@ -39,7 +39,8 @@ data class StatusSnapshot(
     val accessibilityOn: Boolean = false,
     val todayChats: Int = 0,
     val todayTools: Int = 0,
-    val todayFailures: Int = 0
+    val todayFailures: Int = 0,
+    val dexStatus: io.mo.xiaoaiplug.config.DexStatusInfo = io.mo.xiaoaiplug.config.DexStatusInfo()
 )
 
 class ConfigViewModel(app: Application) : AndroidViewModel(app) {
@@ -54,6 +55,103 @@ class ConfigViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _testState = MutableStateFlow<TestState>(TestState.Idle)
     val testState: StateFlow<TestState> = _testState.asStateFlow()
+
+    private val _showDexDialog = MutableStateFlow(false)
+    val showDexDialog: StateFlow<Boolean> = _showDexDialog.asStateFlow()
+
+    private val _isScanningDex = MutableStateFlow(false)
+    val isScanningDex: StateFlow<Boolean> = _isScanningDex.asStateFlow()
+
+    fun openDexDialog() {
+        refreshStatus()
+        _showDexDialog.value = true
+    }
+
+    fun closeDexDialog() {
+        _showDexDialog.value = false
+    }
+
+    /**
+     * 手动触发清除缓存并重新通过 DexKit 扫描分析小爱符号。
+     */
+    fun rescanDexSymbols() {
+        if (_isScanningDex.value) return
+        viewModelScope.launch {
+            _isScanningDex.value = true
+            val success = withContext(Dispatchers.IO) {
+                try {
+                    val app = getApplication<Application>()
+                    val pm = app.packageManager
+                    val appInfo = try {
+                        pm.getPackageInfo("com.miui.voiceassist", 0).applicationInfo
+                    } catch (t: Throwable) {
+                        try {
+                            @Suppress("DEPRECATION")
+                            pm.getApplicationInfo("com.miui.voiceassist", 0)
+                        } catch (t2: Throwable) {
+                            null
+                        }
+                    }
+
+                    val apkPath = appInfo?.sourceDir ?: appInfo?.publicSourceDir
+
+                    if (apkPath.isNullOrBlank() || !java.io.File(apkPath).exists()) {
+                        android.util.Log.w("XiaoAiProbe", "Cannot find XiaoAi base.apk for manual rescan")
+                        return@withContext false
+                    }
+
+                    val apkFile = java.io.File(apkPath)
+                    val apkLastModified = apkFile.lastModified()
+                    val apkLength = apkFile.length()
+                    val pi = try { pm.getPackageInfo("com.miui.voiceassist", 0) } catch (t: Throwable) { null }
+                    val appVer = if (pi != null) {
+                        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+                            "v${pi.longVersionCode}"
+                        } else {
+                            @Suppress("DEPRECATION")
+                            "v${pi.versionCode}"
+                        }
+                    } else ""
+
+                    // 清理本地与内存缓存并强制重新执行 DexKit 搜索
+                    val scannedSymbols = io.mo.xiaoaiplug.hook.dex.DexAdapter.forceRescan(
+                        apkPath = apkPath,
+                        cacheDir = app.cacheDir,
+                        appVersionCode = 0L,
+                        apkLastModified = apkLastModified,
+                        apkLength = apkLength
+                    )
+
+                    // 上报更新至 ConfigProvider
+                    io.mo.xiaoaiplug.config.ConfigClient.reportDexSymbols(
+                        context = app,
+                        symbolsJson = scannedSymbols.toJson().toString(),
+                        durationMs = io.mo.xiaoaiplug.hook.dex.DexAdapter.lastDurationMs,
+                        source = "手动重搜 (DexKit)",
+                        appVersion = appVer
+                    )
+
+                    // 尝试清理小爱内部私有目录缓存
+                    runCatching {
+                        io.mo.xiaoaiplug.hook.dex.DexAdapter.clearCache(java.io.File("/data/data/com.miui.voiceassist/cache"))
+                    }
+
+                    true
+                } catch (t: Throwable) {
+                    android.util.Log.e("XiaoAiProbe", "Manual rescanDexSymbols failed: $t", t)
+                    false
+                }
+            }
+
+            _isScanningDex.value = false
+            refreshStatus()
+            if (success) {
+                showToast("重新扫描完成，耗时 ${io.mo.xiaoaiplug.hook.dex.DexAdapter.lastDurationMs}ms")
+            } else {
+                showToast("未找到小爱 APK 或扫描失败")
+            }
+        }
+    }
 
     /** 底栏上方那条一闪而过的提示。null = 不显示。 */
     private val _toast = MutableStateFlow<String?>(null)
@@ -121,13 +219,15 @@ class ConfigViewModel(app: Application) : AndroidViewModel(app) {
                 val store = LogStore.get(getApplication())
                 val since = startOfToday()
                 val counts = store.countsSince(since)
+                val dex = io.mo.xiaoaiplug.config.ConfigClient.readDexSymbols(getApplication())
                 StatusSnapshot(
                     // isActive() 常量返回 false，被 hook 改写后才是 true —— 见 ModuleStatus
                     moduleActive = ModuleStatus.isActive(),
                     accessibilityOn = isAccessibilityEnabled(),
                     todayChats = counts[LogEntry.TYPE_CHAT] ?: 0,
                     todayTools = counts[LogEntry.TYPE_TOOL] ?: 0,
-                    todayFailures = store.failureCountSince(since)
+                    todayFailures = store.failureCountSince(since),
+                    dexStatus = dex
                 )
             }
             _status.value = snapshot

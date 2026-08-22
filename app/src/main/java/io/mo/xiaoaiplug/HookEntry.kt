@@ -9,10 +9,14 @@ import io.mo.xiaoaiplug.config.AiConfig
 import io.mo.xiaoaiplug.config.ChatHistory
 import io.mo.xiaoaiplug.config.ConfigClient
 import io.mo.xiaoaiplug.hook.SettingsHook
+import io.mo.xiaoaiplug.hook.dex.DexAdapter
+import io.mo.xiaoaiplug.hook.dex.TargetSymbols
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
+import de.robv.android.xposed.XposedHelpers
 import org.json.JSONObject
+import java.io.File
 import java.lang.ref.WeakReference
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -27,64 +31,13 @@ private const val SELF_PKG = "io.mo.xiaoaiplug"
 /** 系统设置。只为了在「小米澎湃 AI」页里挂一个入口,跟语音那条链路无关。 */
 private const val SETTINGS_PKG = "com.android.settings"
 
-private const val OPERATION_MANAGER_CLASS = "com.xiaomi.voiceassistant.instruction.base.OperationManager"
-private const val RN_CARD_CLASS = "com.xiaomi.voiceassistant.instruction.card.TemplateReactNativeCard"
-private const val BRIDGE_CLASS = "r70.a"
-private const val AUDIO_TRACK_MANAGER_CLASS = "v20.e"
-
 // 我们自己的答案播在这条音轨上(n1.speakTts 用的),静音时必须跳过它。
 // 其余的(main / tts / getAuthorization / getNoAccountAuthorization)都是小爱在说话。
 private const val OUR_AUDIO_TRACK = "toastStreamTts"
 
-// 卡片自己的 TTS 播放器(ToastStreamPlayer),喇叭按钮点下去走的就是它:
-//   n1.f95882a.speakTts(String) -> speakDialogId
-// 优先用它而不是 u1.speak:我们的答案是**延迟几秒**才到的,那时小爱的会话常常已经拆了,
-// 而 u1.speak(String) 内部有 `if (this.f56104f != null)` 守卫(f56104f 是 y00.h 引擎),
-// 引擎为 null 时它静默丢弃、一声不吭。n1 设计上就是给"会话早结束、用户回头点重播"用的。
-private const val TOAST_STREAM_PLAYER_CLASS = "la0.n1"
-
-// 小爱自己的 TTS 入口:u1.getInstance().speak(String) 内部会造 t20.e(SelectedVendorTtsRequest,
-// 构造时 updateSettings() 自动带上当前音色/音源设置)交给 y00.h → f10.j1 合成播报。
-// 这是小爱念本地答案(如"当前电量 80%")走的路,音色/打断/音频焦点都是原生行为。
-// 这里只作 n1 失败时的兜底。
-private const val TTS_BRIDGE_CLASS = "com.xiaomi.voiceassistant.u1"
-
 // ASR 指令处理器。小爱把语音识别结果(SpeechRecognizer.RecognizeResult)交给它,
 // 终态结果(isFinal=true)带着 dialogId 和问话原文。
-// 为什么要它:真机日志显示"跳设置"那条 Agent Action 在 setQueryInfo **之前** 334ms 就发出去了,
-// 那时 lastQueryText 还停在上一句,按问话判定必然失效。而终态 ASR 比 Agent Action 早 266ms、
-// 比 setQueryInfo 早 600ms,在这里记问话才来得及拦。
-private const val ASR_PROCESSOR_CLASS = "z10.a"
 private const val ASR_RECOGNIZE_RESULT = "SpeechRecognizer.RecognizeResult"
-
-// AgentActionManager —— 「查看X→跳设置」的**第三条**路,和另外两条完全无关。
-// 小爱不在自己进程里构造 Intent,而是把一条 AIoT action spec
-//   urn:aiot-spec-v3:com.mi.phones:action:[com.miui.securitycenter/powercenter/go_power_model_setting]:0:1.0
-// 经 binder 交给 AiCr 引擎,最终由 com.miui.securitycenter 自己 startActivity 打开自己的页面。
-// 所以 IntentUtilsWrapper / m2 那两个 hook 结构上就抓不到它,只能在小爱侧这个收口拦。
-private const val AGENT_ACTION_CLASS = "kh0.s0"
-
-// TemplateToastOperation —— 小爱那些固定话术卡片的生成处(「应用已经不支持这个功能啦」之类)。
-// 卡片和语音是两条独立的路:语音被静音泵掐掉了,但卡片照样显示 —— 所以还得单独拦这里。
-// g0/i0 都返回 com.xiaomi.voiceassistant.card.a,且它们自己就有 return null 的分支
-// (isScenesOp / isSimulatingClick),说明返回 null 是小爱支持的正常结果,拦起来安全。
-private const val TOAST_OPERATION_CLASS = "jb0.vd"
-
-// UIControllerNavigate 操作(jb0.ue)—— 小爱对"杀/清后台"的**原生**反应其实不是杀,
-// 而是走 NavigateOp.OPEN_BACKGROUND_APPS 分支、由 z0() 模拟按下最近任务键
-// (o6.setSimulateKeyEvent(187) = KEYCODE_APP_SWITCH),把系统"最近任务/清后台"界面划出来。
-// 真机 trace(2026-07-23,hook BaseOperation.<init> + killAppByPkgName 双向确认):
-// 这条命令**从不调 killAppByPkgName**,那段"清后台动画"就是这次 APP_SWITCH。真正的杀是我们干的,
-// 所以我们接管这轮时要把这一下按键跳过 —— 否则先划出最近任务界面、我们再 force-stop,两边各干各的。
-// z0() 只在 OPEN_BACKGROUND_APPS 这一个分支被调,单独拦它不影响别的导航(回主页/退小爱等)。
-private const val UI_NAV_OPERATION_CLASS = "jb0.ue"
-
-// SpeakContentManager —— 小爱"这一轮该念什么"的权威文本源。
-// jb0.hb 把 SpeakStream 分片 addFragment() 累积进去;卡片上那个喇叭按钮
-// (TTSPlayView.k())在 dialogId 匹配时**优先读 b2.getText() 而不是卡片文本**:
-//     if (dialogId == b2.getCurDialogId()) str = b2.getText() else str = card.getTotalText()
-// 所以只改卡片文字不改这里的话,点喇叭放出来的还是小爱的原始答案 —— 声音和字对不上。
-private const val SPEAK_CONTENT_CLASS = "com.xiaomi.voiceassistant.instruction.utils.b2"
 
 // 念出来的答案上限。模型答案可能很长(还可能夹着工具输出),整段念完既吵又没法打断。
 // 超出部分只截断不摘要 —— 卡片上是全文,想看细节看屏幕。
@@ -93,39 +46,12 @@ private const val MAX_SPEAK_CHARS = 220
 // 同一句问话在这个时间窗内出现的多个 dialogId,算作同一次交互
 private const val UTTERANCE_WINDOW_MS = 15_000L
 
-// 「查看类」不跳转:所有跳转系统设置页的语音指令都经过这个 wrapper
-// (现场 trace 确认:startActivitySafely(Intent, boolean),上游是混淆 Operation jb0.g5.Q0)
-private const val INTENT_UTILS_WRAPPER_CLASS = "com.xiaomi.voiceassistant.instruction.utils.IntentUtilsWrapper"
-
-// 小爱答不上来时的兜底(播报"只能帮你到这儿啦"+跳全局搜索)走的是另一条路:
-//   jb0.g5.v1 → N0 → N1 → IntentUtilsWrapper.sendIntent → m2.sendIntent → m2.h → m2.o
-//                                                       → m2.startActivitySafely(Intent, String)
-// 注意它经过的是 IntentUtilsWrapper.**sendIntent** 而不是 startActivitySafely,
-// 所以上面那个 wrapper hook 一次都拦不到(现场 trace 确认)。m2.startActivitySafely 是更靠上的
-// 统一收口 —— 跳设置页那条路最后也汇到它,拦这一处两类跳转都覆盖。
-private const val INTENT_UTILS_CLASS = "com.xiaomi.voiceassistant.utils.m2"
-
 // 兜底跳转的目标:小米全局搜索(act=android.intent.action.SEARCH, dat=qsb://query/...)
 private const val QUICK_SEARCH_PKG = "com.android.quicksearchbox"
-
-// App 内「历史对话」是另一份本地持久化,和卡片渲染完全独立:
-// 库 /data/data/com.miui.voiceassist/databases/VoiceAssistant.db 表 CHAT_MESSAGE_BEAN,
-// 小爱要说的每句话都经 ChatDbManager.recordToSpeak(String) 落库(isSend=0)。
-// 只改卡片不改这里的话,回 App 看历史依旧是"小爱只能帮你到这啦"。
-private const val CHAT_DB_MANAGER_CLASS = "com.xiaomi.voiceassistant.skills.model.chat.a"
 
 // 兜底话术的特征词。实测这句话分三批落库:拦截**之前**就写了两行、我们写完答案之后
 // 又补写了十来行,所以只按"拦截时刻"开时间窗是挡不住的,得按内容认。
 private val FALLBACK_MARKERS = listOf("只能帮你到这", "请手动操作")
-
-// 当前 HyperOS 流式结果里的原生文本答案卡(查看类查询小爱会为它建这张卡)
-private const val FLOW_TOAST_CARD_CLASS = "com.xiaomi.voiceassistant.instruction.card.stream.FlowTemplateToastCard"
-
-// 两套结果渲染 sink,都用 addCard(card.a) 把卡片接进各自会渲染的列表:
-//  - App 内对话用 flowableresult.d;  - 电源键悬浮窗(FloatBoard)用 widget.d(FloatManager)。
-// 谁最近被调用谁就是当前活跃 sink。
-private const val FLOW_CONTROLLER_CLASS = "com.xiaomi.voiceassistant.mainui.flowableresult.d"
-private const val FLOAT_MANAGER_CLASS = "com.xiaomi.voiceassistant.widget.d"
 
 // 「查看类」触发词:命中其一 + 未命中放行词 + 跳转目标是系统设置页 → 拦掉跳转
 private val VIEW_WORDS = listOf(
@@ -189,6 +115,9 @@ private val BT_CONN_QUESTION = Regex("怎么|如何|怎样|为什么")
 
 // 判定"跳转目标确实是系统设置/系统应用",避免误伤导航/打开第三方应用之类的正常跳转
 class HookEntry : IXposedHookLoadPackage {
+
+    @Volatile
+    private var symbols = TargetSymbols()
 
     /** 把本模块进程里的 ModuleStatus.isActive() 替换成返回 true(见 ModuleStatus 的注释)。 */
     private fun hookSelfProbe(cl: ClassLoader) {
@@ -380,6 +309,61 @@ class HookEntry : IXposedHookLoadPackage {
         Log.i(TAG, "loaded into $TARGET_PKG process=${lpparam.processName}")
         targetClassLoader = lpparam.classLoader
 
+        // 动态 Dex 搜索与自适应符号解析 (当检测到小爱更新或初次运行时通过 DexKit 扫描，其余走缓存)
+        val apkPath = lpparam.appInfo?.sourceDir
+        val apkLastModified = if (apkPath != null) File(apkPath).lastModified() else 0L
+        val apkLength = if (apkPath != null) File(apkPath).length() else 0L
+        val cacheDir = lpparam.appInfo?.dataDir?.let { File(it, "cache") }
+
+        try {
+            if (apkPath != null) {
+                symbols = DexAdapter.resolveSymbols(
+                    apkPath = apkPath,
+                    cacheDir = cacheDir,
+                    appVersionCode = 0L,
+                    apkLastModified = apkLastModified,
+                    apkLength = apkLength
+                )
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "DexAdapter symbol resolution failed, fallback to defaults: $t")
+        }
+
+        // 挂钩宿主 Application.onCreate，确保在拥有非空 Context 时将自适应状态同步至模块界面
+        try {
+            XposedHelpers.findAndHookMethod(
+                "android.app.Application",
+                lpparam.classLoader,
+                "onCreate",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val app = param.thisObject as? Context ?: return
+                        val appVer = try {
+                            val pi = app.packageManager.getPackageInfo(app.packageName, 0)
+                            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+                                "v${pi.longVersionCode}"
+                            } else {
+                                @Suppress("DEPRECATION")
+                                "v${pi.versionCode}"
+                            }
+                        } catch (t: Throwable) {
+                            ""
+                        }
+                        Log.i(TAG, "Host Application initialized ($appVer), reporting dex symbols (source=${DexAdapter.lastSource})")
+                        ConfigClient.reportDexSymbols(
+                            context = app,
+                            symbolsJson = symbols.toJson().toString(),
+                            durationMs = DexAdapter.lastDurationMs,
+                            source = DexAdapter.lastSource,
+                            appVersion = appVer
+                        )
+                    }
+                }
+            )
+        } catch (t: Throwable) {
+            Log.w(TAG, "Failed to hook Application.onCreate for dex symbols reporting: $t")
+        }
+
         hookOperationManager(lpparam.classLoader)
         hookRnCard(lpparam.classLoader)
         hookRnCardStop(lpparam.classLoader)
@@ -403,9 +387,9 @@ class HookEntry : IXposedHookLoadPackage {
     // 直接跳过原方法(装作启动成功),这样小爱就不会跳进设置。
     private fun hookSettingsJump(cl: ClassLoader) {
         val clazz = try {
-            cl.loadClass(INTENT_UTILS_WRAPPER_CLASS)
+            cl.loadClass(symbols.intentUtilsWrapperClass)
         } catch (e: Throwable) {
-            Log.i(TAG, "$INTENT_UTILS_WRAPPER_CLASS not found: $e")
+            Log.i(TAG, "${symbols.intentUtilsWrapperClass} not found: $e")
             return
         }
         for (m in clazz.declaredMethods) {
@@ -443,16 +427,16 @@ class HookEntry : IXposedHookLoadPackage {
     // 这 266ms 正是能不能拦住那条跳转的全部余量。
     private fun hookAsrResult(cl: ClassLoader) {
         val clazz = try {
-            cl.loadClass(ASR_PROCESSOR_CLASS)
+            cl.loadClass(symbols.asrProcessorClass)
         } catch (e: Throwable) {
-            Log.i(TAG, "$ASR_PROCESSOR_CLASS not found: $e")
+            Log.i(TAG, "${symbols.asrProcessorClass} not found: $e")
             return
         }
         val method = clazz.declaredMethods.firstOrNull {
             it.name == "processed" && it.parameterTypes.size == 1
         }
         if (method == null) {
-            Log.i(TAG, "z10.a.processed(Instruction) not found")
+            Log.i(TAG, "${symbols.asrProcessorClass}.processed(Instruction) not found")
             return
         }
         try {
@@ -517,7 +501,7 @@ class HookEntry : IXposedHookLoadPackage {
                         if (config != null && config.enabled && config.speakAnswer &&
                             dialogId.isNotBlank() &&
                             (isViewBlockCandidate(text, config) || isSendMessageCommand(text) ||
-                                isKillBackgroundCommand(text) || isAppControlCommand(text))
+                                 isKillBackgroundCommand(text) || isAppControlCommand(text))
                         ) {
                             session(dialogId).pendingViewAnswer = true
                             startMutePump(dialogId)
@@ -527,7 +511,7 @@ class HookEntry : IXposedHookLoadPackage {
                     }
                 }
             })
-            Log.i(TAG, "hooked z10.a.processed (asr)")
+            Log.i(TAG, "hooked ${symbols.asrProcessorClass}.processed (asr)")
         } catch (t: Throwable) {
             Log.i(TAG, "hook asr fail: $t")
         }
@@ -543,9 +527,9 @@ class HookEntry : IXposedHookLoadPackage {
     // 我们只把内容换成自己的。容器、时机、显示模式全部沿用它的机制。
     private fun hookToastCard(cl: ClassLoader) {
         val clazz = try {
-            cl.loadClass(TOAST_OPERATION_CLASS)
+            cl.loadClass(symbols.toastOperationClass)
         } catch (e: Throwable) {
-            Log.i(TAG, "$TOAST_OPERATION_CLASS not found: $e")
+            Log.i(TAG, "${symbols.toastOperationClass} not found: $e")
             return
         }
         val targets = clazz.declaredMethods.filter {
@@ -553,7 +537,7 @@ class HookEntry : IXposedHookLoadPackage {
                 it.parameterTypes.size == 1 && it.parameterTypes[0] == Integer.TYPE
         }
         if (targets.isEmpty()) {
-            Log.i(TAG, "vd.g0/i0(int) not found")
+            Log.i(TAG, "${symbols.toastOperationClass}.g0/i0(int) not found")
             return
         }
         for (m in targets) {
@@ -569,15 +553,15 @@ class HookEntry : IXposedHookLoadPackage {
                             // 注意:这类固定话术 Operation 的 dialogId 是合成字面量
                             // ("fakeDialogId"/"fakeErrorDialogId"),**不是**真实对话 id,
                             // 匹配不上很正常。用"静音泵是否在为当前交互运行"来判定这轮是否归我们。
-                            claimToastCard(card, opDialogId, via = "vd.${m.name}")
+                            claimToastCard(card, opDialogId, via = "toastOp.${m.name}")
                         } catch (t: Throwable) {
                             Log.i(TAG, "hookToastCard error: $t")
                         }
                     }
                 })
-                Log.i(TAG, "hooked vd.${m.name}(int)")
+                Log.i(TAG, "hooked ${symbols.toastOperationClass}.${m.name}(int)")
             } catch (t: Throwable) {
-                Log.i(TAG, "hook vd.${m.name} fail: $t")
+                Log.i(TAG, "hook ${symbols.toastOperationClass}.${m.name} fail: $t")
             }
         }
     }
@@ -588,9 +572,9 @@ class HookEntry : IXposedHookLoadPackage {
     // 观感是两边各干各的。只在 ownsKillTurnNow()(确是我们接管的杀后台轮)时跳过,不误伤正常导航。
     private fun hookBackgroundAppsNav(cl: ClassLoader) {
         val clazz = try {
-            cl.loadClass(UI_NAV_OPERATION_CLASS)
+            cl.loadClass(symbols.uiNavOperationClass)
         } catch (e: Throwable) {
-            Log.i(TAG, "$UI_NAV_OPERATION_CLASS not found: $e")
+            Log.i(TAG, "${symbols.uiNavOperationClass} not found: $e")
             return
         }
         // z0() 无参、只做 setSimulateKeyEvent(187);按名字精确取,取不到就算了(混淆改名时不至于拖垮别的)
@@ -598,7 +582,7 @@ class HookEntry : IXposedHookLoadPackage {
             it.name == "z0" && it.parameterTypes.isEmpty()
         }
         if (method == null) {
-            Log.i(TAG, "ue.z0() not found (obfuscation changed?)")
+            Log.i(TAG, "${symbols.uiNavOperationClass}.z0() not found (obfuscation changed?)")
             return
         }
         try {
@@ -613,9 +597,9 @@ class HookEntry : IXposedHookLoadPackage {
                     }
                 }
             })
-            Log.i(TAG, "hooked ue.z0 (OPEN_BACKGROUND_APPS)")
+            Log.i(TAG, "hooked ${symbols.uiNavOperationClass}.z0 (OPEN_BACKGROUND_APPS)")
         } catch (t: Throwable) {
-            Log.i(TAG, "hook ue.z0 fail: $t")
+            Log.i(TAG, "hook ${symbols.uiNavOperationClass}.z0 fail: $t")
         }
     }
 
@@ -634,16 +618,16 @@ class HookEntry : IXposedHookLoadPackage {
     // 顺带把它们汇入的 execute 也挂上,免得有调用方绕过重载直接进去。
     private fun hookAgentAction(cl: ClassLoader) {
         val clazz = try {
-            cl.loadClass(AGENT_ACTION_CLASS)
+            cl.loadClass(symbols.agentActionClass)
         } catch (e: Throwable) {
-            Log.i(TAG, "$AGENT_ACTION_CLASS not found: $e")
+            Log.i(TAG, "${symbols.agentActionClass} not found: $e")
             return
         }
         val targets = clazz.declaredMethods.filter {
             it.name == "executeActionsAsync" || it.name == "execute"
         }
         if (targets.isEmpty()) {
-            Log.i(TAG, "s0.executeActionsAsync not found")
+            Log.i(TAG, "${symbols.agentActionClass}.executeActionsAsync not found")
             return
         }
         for (m in targets) {
@@ -668,9 +652,9 @@ class HookEntry : IXposedHookLoadPackage {
                         }
                     }
                 })
-                Log.i(TAG, "hooked s0.${m.name}(${m.parameterTypes.joinToString { it.simpleName }})")
+                Log.i(TAG, "hooked ${symbols.agentActionClass}.${m.name}(${m.parameterTypes.joinToString { it.simpleName }})")
             } catch (t: Throwable) {
-                Log.i(TAG, "hook s0.${m.name} fail: $t")
+                Log.i(TAG, "hook ${symbols.agentActionClass}.${m.name} fail: $t")
             }
         }
     }
@@ -859,9 +843,9 @@ class HookEntry : IXposedHookLoadPackage {
     // 所以拦下来必须回 0 冒充成功。
     private fun hookWebSearchFallback(cl: ClassLoader) {
         val clazz = try {
-            cl.loadClass(INTENT_UTILS_CLASS)
+            cl.loadClass(symbols.intentUtilsClass)
         } catch (e: Throwable) {
-            Log.i(TAG, "$INTENT_UTILS_CLASS not found: $e")
+            Log.i(TAG, "${symbols.intentUtilsClass} not found: $e")
             return
         }
         val method = try {
@@ -900,9 +884,9 @@ class HookEntry : IXposedHookLoadPackage {
     // 方法名 k 是混淆产物,所以按 (Context, Intent) 签名找,不写死名字。
     private fun hookIntentLaunch(cl: ClassLoader) {
         val clazz = try {
-            cl.loadClass(INTENT_UTILS_CLASS)
+            cl.loadClass(symbols.intentUtilsClass)
         } catch (e: Throwable) {
-            Log.i(TAG, "$INTENT_UTILS_CLASS not found: $e")
+            Log.i(TAG, "${symbols.intentUtilsClass} not found: $e")
             return
         }
         val targets = clazz.declaredMethods.filter {
@@ -942,9 +926,9 @@ class HookEntry : IXposedHookLoadPackage {
     // 压制小爱写进历史库的兜底文案(只在我们拦了跳转、且自己的答案还没写进去的这段时间内)
     private fun hookChatHistory(cl: ClassLoader) {
         val clazz = try {
-            cl.loadClass(CHAT_DB_MANAGER_CLASS)
+            cl.loadClass(symbols.chatDbManagerClass)
         } catch (e: Throwable) {
-            Log.i(TAG, "$CHAT_DB_MANAGER_CLASS not found: $e")
+            Log.i(TAG, "${symbols.chatDbManagerClass} not found: $e")
             return
         }
         // 拦 insert(bean) 而不是 recordToSpeak:那句兜底文案实测走的是 m(str, dialogId)
@@ -1010,7 +994,7 @@ class HookEntry : IXposedHookLoadPackage {
         val cl = targetClassLoader ?: return
         try {
             writingHistory.set(true)
-            val clazz = cl.loadClass(CHAT_DB_MANAGER_CLASS)
+            val clazz = cl.loadClass(symbols.chatDbManagerClass)
             val instance = clazz.getMethod("getInstance").invoke(null) ?: return
             clazz.getDeclaredMethod("recordToSpeak", String::class.java).invoke(instance, answer)
             Log.i(TAG, "answer written to history dialogId=$dialogId")
@@ -1068,7 +1052,7 @@ class HookEntry : IXposedHookLoadPackage {
     // 捕获当前活跃的结果渲染 sink:App(flowableresult.d)和悬浮窗(widget.d)各用一套,
     // 两套的 addCard 都 hook,谁最近被调用(当前会话的 query/loading 卡就是它加的)谁就是活跃 sink。
     private fun hookCardSinks(cl: ClassLoader) {
-        for (className in listOf(FLOW_CONTROLLER_CLASS, FLOAT_MANAGER_CLASS)) {
+        for (className in listOf(symbols.flowControllerClass, symbols.floatManagerClass)) {
             val clazz = try {
                 cl.loadClass(className)
             } catch (e: Throwable) {
@@ -1181,7 +1165,7 @@ class HookEntry : IXposedHookLoadPackage {
         }
         Handler(Looper.getMainLooper()).post {
             try {
-                val cardClass = cl.loadClass(FLOW_TOAST_CARD_CLASS)
+                val cardClass = cl.loadClass(symbols.flowToastCardClass)
                 val ctor = cardClass.getConstructor(Integer.TYPE, String::class.java)
                 val card = ctor.newInstance(0, answer ?: THINKING_PLACEHOLDER)
                 try {
@@ -1228,9 +1212,9 @@ class HookEntry : IXposedHookLoadPackage {
     // 这里在 bindView 之后补一刀,并把 TextView 的实际状态打出来,便于确认到底有没有生效。
     private fun hookToastCardBind(cl: ClassLoader) {
         val clazz = try {
-            cl.loadClass(FLOW_TOAST_CARD_CLASS)
+            cl.loadClass(symbols.flowToastCardClass)
         } catch (e: Throwable) {
-            Log.i(TAG, "$FLOW_TOAST_CARD_CLASS not found: $e")
+            Log.i(TAG, "${symbols.flowToastCardClass} not found: $e")
             return
         }
         for (m in clazz.declaredMethods) {
@@ -1392,7 +1376,7 @@ class HookEntry : IXposedHookLoadPackage {
     // 这里等 JS ready 之后再补一次注入。
     private fun hookRnJsReady(cl: ClassLoader) {
         val clazz = try {
-            cl.loadClass(RN_CARD_CLASS)
+            cl.loadClass(symbols.rnCardClass)
         } catch (e: Throwable) {
             return
         }
@@ -1444,9 +1428,9 @@ class HookEntry : IXposedHookLoadPackage {
     // 所以:在还没等到我们自己答案注入完成之前,直接跳过这次 onStop,保持 RN 存活。
     private fun hookRnCardStop(cl: ClassLoader) {
         val clazz = try {
-            cl.loadClass(RN_CARD_CLASS)
+            cl.loadClass(symbols.rnCardClass)
         } catch (e: Throwable) {
-            Log.i(TAG, "$RN_CARD_CLASS not found: $e")
+            Log.i(TAG, "${symbols.rnCardClass} not found: $e")
             return
         }
         for (m in clazz.declaredMethods) {
@@ -1512,9 +1496,9 @@ class HookEntry : IXposedHookLoadPackage {
     // 拦截"用户问了什么" —— OperationManager.setQueryInfo(dialogId, query, extraInfo),比具体某个卡片的构造函数更早更通用
     private fun hookOperationManager(cl: ClassLoader) {
         val clazz = try {
-            cl.loadClass(OPERATION_MANAGER_CLASS)
+            cl.loadClass(symbols.operationManagerClass)
         } catch (e: Throwable) {
-            Log.i(TAG, "$OPERATION_MANAGER_CLASS not found: $e")
+            Log.i(TAG, "${symbols.operationManagerClass} not found: $e")
             return
         }
         val method = try {
@@ -1628,9 +1612,9 @@ class HookEntry : IXposedHookLoadPackage {
     // 记录 TemplateReactNativeCard 实例(按 dialogId),以便接管时能强制显示卡片
     private fun hookRnCard(cl: ClassLoader) {
         val clazz = try {
-            cl.loadClass(RN_CARD_CLASS)
+            cl.loadClass(symbols.rnCardClass)
         } catch (e: Throwable) {
-            Log.i(TAG, "$RN_CARD_CLASS not found: $e")
+            Log.i(TAG, "${symbols.rnCardClass} not found: $e")
             return
         }
         for (name in listOf("bindView", "onCardAttached")) {
@@ -1666,9 +1650,9 @@ class HookEntry : IXposedHookLoadPackage {
     //  - 我们自己发起的调用(injectingNow=true)直接放行
     private fun hookBridge(cl: ClassLoader) {
         val clazz = try {
-            cl.loadClass(BRIDGE_CLASS)
+            cl.loadClass(symbols.bridgeClass)
         } catch (e: Throwable) {
-            Log.i(TAG, "$BRIDGE_CLASS not found: $e")
+            Log.i(TAG, "${symbols.bridgeClass} not found: $e")
             return
         }
         val method = try {
@@ -1904,7 +1888,7 @@ class HookEntry : IXposedHookLoadPackage {
     // 之后 addFragment 就会重建缓冲区。
     private fun syncSpeakContent(cl: ClassLoader, dialogId: String, text: String) {
         try {
-            val clazz = cl.loadClass(SPEAK_CONTENT_CLASS)
+            val clazz = cl.loadClass(symbols.speakContentClass)
             val instance = kotlinObjectInstance(clazz) ?: return
             clazz.getMethod("clean").invoke(instance)
             clazz.getMethod("addFragment", String::class.java, String::class.java)
@@ -1918,7 +1902,7 @@ class HookEntry : IXposedHookLoadPackage {
     // 走卡片自己的 ToastStreamPlayer。会话已经拆掉也能播,而且播放状态监听会驱动喇叭图标动画。
     private fun speakViaToastPlayer(cl: ClassLoader, text: String): Boolean {
         return try {
-            val clazz = cl.loadClass(TOAST_STREAM_PLAYER_CLASS)
+            val clazz = cl.loadClass(symbols.toastStreamPlayerClass)
             val instance = kotlinObjectInstance(clazz) ?: return false
             clazz.getMethod("stopPlay").invoke(instance)
             // speakTts 成功返回合成事件 id,文本为空时返回 null
@@ -1953,7 +1937,7 @@ class HookEntry : IXposedHookLoadPackage {
     // 兜底:小爱念本地答案那条路。引擎(u1.f56104f)为 null 时它会静默丢弃,所以只当备选。
     private fun speakViaEngine(cl: ClassLoader, text: String): Boolean {
         return try {
-            val clazz = cl.loadClass(TTS_BRIDGE_CLASS)
+            val clazz = cl.loadClass(symbols.ttsBridgeClass)
             val instance = clazz.getMethod("getInstance").invoke(null) ?: return false
             clazz.getMethod("speak", String::class.java).invoke(instance, text)
             true
@@ -1993,7 +1977,7 @@ class HookEntry : IXposedHookLoadPackage {
     private fun muteAudio() {
         try {
             val ctx = currentApplicationContext() ?: return
-            val clazz = ctx.classLoader.loadClass(AUDIO_TRACK_MANAGER_CLASS)
+            val clazz = ctx.classLoader.loadClass(symbols.audioTrackManagerClass)
             val tracks = allAudioTracks(clazz)
             if (tracks.isEmpty()) {
                 muteMainTrackOnly(clazz)   // 注册表拿不到就退回老做法,至少掐住主音轨
