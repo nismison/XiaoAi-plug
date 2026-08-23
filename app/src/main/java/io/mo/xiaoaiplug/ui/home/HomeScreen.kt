@@ -60,7 +60,7 @@ fun HomeScreen(
                 )
                 StatusRow(
                     ok = status.dexStatus.symbols.asrProcessorClass.isNotBlank(),
-                    title = "符号自适应",
+                    title = "DEX缓存适配",
                     summary = if (status.dexStatus.source.isNotBlank())
                         "已适配 17/17 个混淆类 · ${status.dexStatus.source}"
                     else "已就绪 17/17 个混淆类",

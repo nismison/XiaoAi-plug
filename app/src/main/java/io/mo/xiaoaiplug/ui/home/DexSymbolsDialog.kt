@@ -176,7 +176,7 @@ fun DexSymbolsDialog(
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(
-                                    text = "符号自适应搜索结果",
+                                    text = "DEX搜索结果",
                                     fontSize = 18.sp,
                                     fontWeight = FontWeight.Bold,
                                     color = MiuixTheme.colorScheme.onSurface

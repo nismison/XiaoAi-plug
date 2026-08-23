@@ -151,7 +151,7 @@ class ConfigProvider : ContentProvider() {
      * 得等用户在设置页明确打开(那时会先验一次 root)才生效。
      */
     private fun autoFixEnabled(): Boolean =
-        prefs().getString(ConfigKeys.AUTO_FIX_ACCESSIBILITY, "") == "true"
+        prefs().all[ConfigKeys.AUTO_FIX_ACCESSIBILITY]?.toString() == "true"
 
     /** 调用方是否有权调用 [method]。callingPackage 由系统填,伪造不了。 */
     private fun isCallerAllowed(method: String): Boolean {
@@ -165,6 +165,7 @@ class ConfigProvider : ContentProvider() {
         return when (method) {
             METHOD_GET -> {
                 val p = prefs()
+                val allPrefs = p.all
                 val out = Bundle()
                 for (k in ConfigKeys.ALL) {
                     // getString 的第二个参数只在"这个 key 从没存过"时才生效,用户主动存成
@@ -172,7 +173,13 @@ class ConfigProvider : ContentProvider() {
                     // 和"用户手动清空"(就是要它不生效),两者在存进 SharedPreferences 后都是空串,
                     // 只有靠"存过没存过"才分得开。
                     val fallback = if (k == ConfigKeys.SKIP_TAKEOVER_PATTERN) DEFAULT_SKIP_TAKEOVER_PATTERN else ""
-                    out.putString(k, p.getString(k, fallback))
+                    val rawVal = allPrefs[k]
+                    val strVal = when (rawVal) {
+                        null -> fallback
+                        is String -> rawVal
+                        else -> rawVal.toString()
+                    }
+                    out.putString(k, strVal)
                 }
                 out
             }
@@ -293,8 +300,8 @@ class ConfigProvider : ContentProvider() {
 
                     val e = prefs().edit()
                     e.putString(ConfigKeys.DEX_SYMBOLS_JSON, symbolsJson)
-                    e.putLong(ConfigKeys.DEX_SYMBOLS_TIME, time)
-                    e.putLong(ConfigKeys.DEX_SYMBOLS_DURATION, duration)
+                    e.putString(ConfigKeys.DEX_SYMBOLS_TIME, time.toString())
+                    e.putString(ConfigKeys.DEX_SYMBOLS_DURATION, duration.toString())
                     e.putString(ConfigKeys.DEX_SYMBOLS_SOURCE, source)
                     e.putString(ConfigKeys.DEX_APP_VERSION, appVersion)
                     e.apply()
