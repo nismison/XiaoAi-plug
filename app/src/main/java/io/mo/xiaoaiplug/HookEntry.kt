@@ -14,6 +14,7 @@ import io.mo.xiaoaiplug.hook.dex.TargetSymbols
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
+import de.robv.android.xposed.XposedHelpers
 import org.json.JSONObject
 import java.io.File
 import java.lang.ref.WeakReference
@@ -309,26 +310,58 @@ class HookEntry : IXposedHookLoadPackage {
         targetClassLoader = lpparam.classLoader
 
         // 动态 Dex 搜索与自适应符号解析 (当检测到小爱更新或初次运行时通过 DexKit 扫描，其余走缓存)
+        val apkPath = lpparam.appInfo?.sourceDir
+        val apkLastModified = if (apkPath != null) File(apkPath).lastModified() else 0L
+        val apkLength = if (apkPath != null) File(apkPath).length() else 0L
+        val cacheDir = lpparam.appInfo?.dataDir?.let { File(it, "cache") }
+
         try {
-            val apkPath = lpparam.appInfo?.sourceDir
-            val apkLastModified = if (apkPath != null) File(apkPath).lastModified() else 0L
-            val appVersionCode = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
-                lpparam.appInfo?.longVersionCode ?: 0L
-            } else {
-                @Suppress("DEPRECATION")
-                lpparam.appInfo?.versionCode?.toLong() ?: 0L
-            }
-            val cacheDir = lpparam.appInfo?.dataDir?.let { File(it, "cache") }
             if (apkPath != null) {
                 symbols = DexAdapter.resolveSymbols(
                     apkPath = apkPath,
                     cacheDir = cacheDir,
-                    appVersionCode = appVersionCode,
-                    apkLastModified = apkLastModified
+                    appVersionCode = 0L,
+                    apkLastModified = apkLastModified,
+                    apkLength = apkLength
                 )
             }
         } catch (t: Throwable) {
             Log.w(TAG, "DexAdapter symbol resolution failed, fallback to defaults: $t")
+        }
+
+        // 挂钩宿主 Application.onCreate，确保在拥有非空 Context 时将自适应状态同步至模块界面
+        try {
+            XposedHelpers.findAndHookMethod(
+                "android.app.Application",
+                lpparam.classLoader,
+                "onCreate",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val app = param.thisObject as? Context ?: return
+                        val appVer = try {
+                            val pi = app.packageManager.getPackageInfo(app.packageName, 0)
+                            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+                                "v${pi.longVersionCode}"
+                            } else {
+                                @Suppress("DEPRECATION")
+                                "v${pi.versionCode}"
+                            }
+                        } catch (t: Throwable) {
+                            ""
+                        }
+                        Log.i(TAG, "Host Application initialized ($appVer), reporting dex symbols (source=${DexAdapter.lastSource})")
+                        ConfigClient.reportDexSymbols(
+                            context = app,
+                            symbolsJson = symbols.toJson().toString(),
+                            durationMs = DexAdapter.lastDurationMs,
+                            source = DexAdapter.lastSource,
+                            appVersion = appVer
+                        )
+                    }
+                }
+            )
+        } catch (t: Throwable) {
+            Log.w(TAG, "Failed to hook Application.onCreate for dex symbols reporting: $t")
         }
 
         hookOperationManager(lpparam.classLoader)
