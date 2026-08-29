@@ -175,6 +175,8 @@ class HookEntry : IXposedHookLoadPackage {
         @Volatile var answerCardSink: WeakReference<Any>? = null
         /** 从现在起压制小爱写进历史库的兜底文案,直到我们的答案写进去。 */
         @Volatile var historyPending: Boolean = false
+        /** RN 前端是否已回调 rnStartReceiveInstruction 准备好接收流式数据。 */
+        @Volatile var rnJsReady: Boolean = false
         /** 已完成注入,防重复。原子:并发只放第一个过。 */
         val injected = AtomicBoolean(false)
         /** 答案已写进历史,防重复(recordToSpeak 一次交互会被连调十来次)。原子。 */
@@ -1110,6 +1112,11 @@ class HookEntry : IXposedHookLoadPackage {
     private fun ensureAnswerCard(dialogId: String) {
         val s = sessionOrNull(dialogId) ?: return
         if (!s.pendingViewAnswer) return
+        // 若 RN 卡片已存在,则由 RN 卡片承载显示,不自建/更新重复的 ToastCard
+        if (s.cardRef?.get() != null || s.bridgeRef?.get() != null) {
+            Log.i(TAG, "RN card already active for dialogId=$dialogId, skip ToastCard ensureAnswerCard")
+            return
+        }
         val cl = targetClassLoader ?: return
         val answer = s.aiAnswer
 
@@ -1391,7 +1398,9 @@ class HookEntry : IXposedHookLoadPackage {
                                     .invoke(card) as? String ?: return
                                 Log.i(TAG, "[rn] js ready dialogId=$dialogId hash=${System.identityHashCode(card)}")
                                 if (dialogId.isNotBlank()) {
-                                    session(dialogId).cardRef = WeakReference(card)
+                                    val s = session(dialogId)
+                                    s.rnJsReady = true
+                                    s.cardRef = WeakReference(card)
                                     maybeInject(dialogId)
                                 }
                             } catch (t: Throwable) {
@@ -1407,16 +1416,30 @@ class HookEntry : IXposedHookLoadPackage {
         }
     }
 
-    // 读取卡片的 Z3 字段:RN JS 侧是否已经准备好接收数据
-    private fun isRnFrontReady(dialogId: String): Boolean? {
-        val card = sessionOrNull(dialogId)?.cardRef?.get() ?: return null
+    // 读取卡片:RN JS 侧是否已经准备好接收数据
+    private fun isRnFrontReady(dialogId: String): Boolean {
+        val s = sessionOrNull(dialogId)
+        if (s?.rnJsReady == true) return true
+        val card = s?.cardRef?.get() ?: return false
         return try {
-            val f = card.javaClass.getDeclaredField("Z3")
-            f.isAccessible = true
-            f.getBoolean(card)
+            var found = false
+            var c: Class<*>? = card.javaClass
+            while (c != null && c != Any::class.java) {
+                for (f in c.declaredFields) {
+                    if (f.type == java.lang.Boolean.TYPE) {
+                        f.isAccessible = true
+                        if (f.getBoolean(card)) {
+                            found = true
+                            break
+                        }
+                    }
+                }
+                if (found) break
+                c = c.superclass
+            }
+            found
         } catch (t: Throwable) {
-            Log.i(TAG, "read Z3 failed dialogId=$dialogId: $t")
-            null
+            true // 异常时乐观放行,避免卡住数据注入
         }
     }
 
@@ -1532,52 +1555,41 @@ class HookEntry : IXposedHookLoadPackage {
                         return // 未启用 AI 接管,保持原生行为(但跳转拦截仍可生效)
                     }
                     // 白名单直通:这句命中用户自己配的正则 → 整句都不接管,原生行为原样放行。
-                    // 用在"小爱自己处理得又快又好、我们没有对应工具"的场景(比如点播歌曲) ——
-                    // 硬接管只会白起一次泵、白调一次注定失败的模型,日志里还多一条误导性的"工具调用失败"。
                     if (isAiTakeoverSkip(queryText, config)) {
                         Log.i(TAG, "skip takeover (whitelist pattern matched): $queryText")
                         return
                     }
-                    // 是"查看类"候选 → 预标记,以便它的 FlowTemplateToastCard 一 bindView 就被我们占位撑开。
-                    // 用 ...Now() 而不是 isViewBlockCandidate(queryText):此刻 lastQueryText 已经是
-                    // 改写版,而 ASR 原文还在 lastAsrText 里,两个都要看(见 lastAsrText 注释)。
+
+                    // 立即标记接管并开启静音泵,从第 0ms 彻底掐死小爱云端流式下发的主音轨,
+                    // 绝不给小爱原生 TTS 抢跑开口的机会(避免替换前后两段声音一起播放)。
+                    val s = session(dialogId)
+                    s.takenOver = true
+                    if (config.speakAnswer) {
+                        startMutePump(dialogId)
+                    }
+
+                    // 是"查看类"候选 → 预标记,以便在没有 RN 卡片时通过 FlowTemplateToastCard 撑开占位。
                     if (viewBlockCandidateNow(config)) {
-                        session(dialogId).pendingViewAnswer = true
-                        // 这里**不**预先自建占位卡。优先接管小爱自己那张话术卡
-                        // (hookToastCard):它的容器和显示时机都是对的,自建的插进去不上屏。
-                        // 小爱这轮如果压根不出话术卡,答案到达时 ensureAnswerCard 再兜底自建。
-                        // 这一刻就已经确定"这句我们自己答",立刻起泵按住小爱的嘴。
-                        // 真机日志显示不这么做的后果:小爱 450ms 后就 onRealStart,完整念完
-                        // 4.9 秒(onPlayFinish isInterrupted=false),9 秒后我们才开口 —— 两个答案
-                        // 一前一后全放出来。以前泵接在 takeOver 上,而这条路径根本不经过 takeOver。
-                        if (config.speakAnswer) startMutePump(dialogId)
+                        s.pendingViewAnswer = true
                     }
                     // 发消息类:小爱这轮注定失败(双开/仅语音),我们接管。
-                    // 同样要起泵 —— 否则它那句"暂不支持微信双开功能"会照常念出来。
                     if (sendMessageCommandNow()) {
-                        session(dialogId).pendingViewAnswer = true
-                        if (config.speakAnswer) startMutePump(dialogId)
+                        s.pendingViewAnswer = true
                         Log.i(TAG, "send-message command, taking over: $queryText")
                     }
                     // 杀后台类:小爱原生做不到真正的 force-stop/kill,我们接管。
-                    // 加进 pendingViewAnswer 就把动作闸打开了(allowMutating 的判据之一),
-                    // 模型这轮的 am force-stop / kill 才不会被 Tools.execute 拦成 dur=0ms。
                     if (killBackgroundCommandNow()) {
-                        session(dialogId).pendingViewAnswer = true
-                        if (config.speakAnswer) startMutePump(dialogId)
+                        s.pendingViewAnswer = true
                         Log.i(TAG, "kill-background command, taking over: $queryText")
                     }
                     // 冻结/解冻/清缓存类:同样接管以放行 app_state_control 动作闸。
                     if (appControlCommandNow()) {
-                        session(dialogId).pendingViewAnswer = true
-                        if (config.speakAnswer) startMutePump(dialogId)
+                        s.pendingViewAnswer = true
                         Log.i(TAG, "app-control command, taking over: $queryText")
                     }
-                    // 连接/断开蓝牙设备类:小爱原生连不了指定设备,接管以放行 bluetooth_control 的
-                    // connect/disconnect 动作闸(否则被 Tools.execute 拦成"未接管")。
+                    // 连接/断开蓝牙设备类:小爱原生连不了指定设备,接管以放行 bluetooth_control 动作闸。
                     if (btConnectCommandNow()) {
-                        session(dialogId).pendingViewAnswer = true
-                        if (config.speakAnswer) startMutePump(dialogId)
+                        s.pendingViewAnswer = true
                         Log.i(TAG, "bt-connect command, taking over: $queryText")
                     }
                     // queryText 非 null = 这个 dialogId 已处理过。存在性即去重判据,所以用可空而非空串。
@@ -1607,6 +1619,7 @@ class HookEntry : IXposedHookLoadPackage {
                 }
             }
         })
+        Log.i(TAG, "hooked ${symbols.operationManagerClass}.setQueryInfo")
     }
 
     // 记录 TemplateReactNativeCard 实例(按 dialogId),以便接管时能强制显示卡片
@@ -1636,6 +1649,7 @@ class HookEntry : IXposedHookLoadPackage {
                                 }
                             }
                         })
+                        Log.i(TAG, "hooked ${symbols.rnCardClass}.$name")
                     } catch (t: Throwable) {
                         Log.i(TAG, "hook $name fail: $t")
                     }
@@ -1668,55 +1682,25 @@ class HookEntry : IXposedHookLoadPackage {
                     if (injectingNow.get() == true) return
                     val type = param.args[0] as? String ?: return
                     val content = (param.args[1] as? String).orEmpty()
-                    val dialogId = extractDialogId(content)
+                    val dialogId = extractDialogId(content) ?: lastDialogId
 
                     // "Finish" / "cancel" 这类控制信令的 content 是空的,里面没有 dialog_id。
-                    // 小爱回答简单问题时不到一秒就结束,会抢在我们的答案注入之前把 Finish 发给 JS,
-                    // 前端收到后就把这张卡的流关掉了 —— 之后我们再 sendStreamData 前端直接忽略,
-                    // Java 层却不会报任何错(这就是"简单问题不显示文字"的真正原因)。
-                    // 所以只要还有接管中、尚未注入完成的对话,就先把这些控制信令拦下来。
-                    if (dialogId == null) {
-                        if (sessions.values.any { it.takenOver && !it.injected.get() }) {
+                    // 只要还有接管中、尚未注入完成的对话或静音泵在运行,就先把这些控制信令拦下来,
+                    // 避免前端提前关闭流导致我们后续的 sendStreamData 无法上屏。
+                    if (type == "Finish" || type == "cancel") {
+                        if (sessions.values.any { it.takenOver && !it.injected.get() } || isMutePumpActive()) {
                             Log.i(TAG, "suppress control signal type=$type (takeover pending)")
                             param.result = null
                         }
                         return
                     }
 
-                    // queryText 非 null(setQueryInfo 见过它)且还没接管 → 现在接管。
-                    // queryText != null 已隐含 session 存在,所以这里 sessionOrNull 拿到的必非空。
-                    val known = sessionOrNull(dialogId)
-                    if (known?.queryText != null && !known.takenOver) {
-                        known.takenOver = true
-                        Log.i(TAG, "take over dialogId=$dialogId")
-                        // 这里原本只打一发 muteAudio()。真机日志显示那是在赌运气:
-                        //   05.960 小爱 startPlay_url: main / 06.182 onRealStart(真出声)
-                        //   06.183 我们 stopPlayAndClearQueue / 06.184 onPlayFinish isInterrupted=true
-                        // 只差 2ms 掐住。小爱的 TTS 是云端流式回来的,起播晚个几百毫秒
-                        // 这一发就打空了 —— 现象就是"替换过的和没替换过的一起放"。
-                        // 换成持续钳制主音轨,不管它什么时候起播都能在 250ms 内按掉。
-                        startMutePump(dialogId)
-                        maybeForceShow(dialogId)
-                    }
-                    // 小爱自己的 ToastStream 答案漏网补刀:只要静音泵在跑(说明这轮交互确实由我们接管),
-                    // 就无差别把 ToastStream 滤掉 —— 哪怕这条指令挂的 dialogId 还没进 takeOver。
-                    // 真机实测:小爱给"搜索类"答案用的 dialogId 常和 ASR 那个对不上,光靠 dialogId in
-                    // takeOver 判会漏,它那段("若想了解…/很抱歉…")就照样上屏,和我们的答案并列成两段。
-                    // 这里只删小爱的文字内容(filterOutToastStream 只摘 ToastStream 条目),不碰接管流程。
-                    val takenOverNow = sessionOrNull(dialogId)?.takenOver == true
-                    if (type == "instruction" && !takenOverNow && isMutePumpActive()) {
-                        val filtered = filterOutToastStream(content)
-                        if (filtered == null) {
-                            Log.i(TAG, "suppress xiaoai ToastStream (pump active, dialogId=$dialogId not-yet-takeover)")
-                            param.result = null
-                            return
-                        } else if (filtered != content) {
-                            Log.i(TAG, "stripped xiaoai ToastStream (pump active) dialogId=$dialogId")
-                            param.args[1] = filtered
-                        }
-                    }
-                    if (takenOverNow && type == "instruction") {
+                    if (dialogId.isNotBlank()) {
                         session(dialogId).bridgeRef = WeakReference(param.thisObject)
+                    }
+
+                    val takenOverNow = sessionOrNull(dialogId)?.takenOver == true || isMutePumpActive()
+                    if (takenOverNow && type == "instruction") {
                         val filtered = filterOutToastStream(content)
                         if (filtered == null) {
                             Log.i(TAG, "suppress whole content dialogId=$dialogId (nothing left after filtering)")
@@ -1727,7 +1711,9 @@ class HookEntry : IXposedHookLoadPackage {
                         } else {
                             Log.i(TAG, "no ToastStream found, pass through dialogId=$dialogId")
                         }
-                        maybeInject(dialogId)
+                        if (dialogId.isNotBlank()) {
+                            maybeInject(dialogId)
+                        }
                     } else if (takenOverNow) {
                         // 非 instruction 类型(比如语音相关的其它 type)一律拦掉
                         Log.i(TAG, "suppress non-instruction type=$type dialogId=$dialogId")
@@ -1738,6 +1724,7 @@ class HookEntry : IXposedHookLoadPackage {
                 }
             }
         })
+        Log.i(TAG, "hooked ${symbols.bridgeClass}.sendStreamData")
     }
 
     // content 可能是单个 instruction 的 JSON 对象,也可能是打包了多条 instruction 的 JSON 数组。
@@ -2038,7 +2025,7 @@ class HookEntry : IXposedHookLoadPackage {
     }
 
     private fun extractDialogId(content: String): String? {
-        val m = Regex("\"dialog_id\"\\s*:\\s*\"([a-zA-Z0-9]+)\"").find(content)
+        val m = Regex("\"dialog_id\"\\s*:\\s*\"([^\"]+)\"").find(content)
         return m?.groupValues?.get(1)
     }
 
@@ -2083,7 +2070,9 @@ class HookEntry : IXposedHookLoadPackage {
     // 把文本推到这次问话名下所有活着的答案卡(自建卡 + 认领来的话术卡都算)。best-effort。
     private fun pushStreamingText(key: String, text: String) {
         for (id in utteranceDialogs[key].orEmpty()) {
-            val card = sessionOrNull(id)?.answerCard?.get() ?: continue
+            val s = sessionOrNull(id) ?: continue
+            if (s.cardRef?.get() != null) continue // 由 RN 卡片流式处理,避免 ToastCard 重复显示
+            val card = s.answerCard?.get() ?: continue
             // 登记好该显示什么,bindView 会据此强制回填,和流式保持一致。
             ourCardTexts[System.identityHashCode(card)] = text
             Handler(Looper.getMainLooper()).post {
@@ -2176,9 +2165,9 @@ class HookEntry : IXposedHookLoadPackage {
         val answer = s.aiAnswer ?: return   // 答案还没到,正常路过,不值得记
         // 下面两个缺一样都等于"这轮永远不会上屏"。原先是静默 return,
         // 于是"卡片一直空白"在日志里和"根本没走到这"长得一模一样,只能靠猜。
-        val bridge = s.bridgeRef?.get()
+        val bridge = s.bridgeRef?.get() ?: sessionOrNull(lastDialogId)?.bridgeRef?.get()
         if (bridge == null) {
-            Log.i(TAG, "no bridge for dialogId=$dialogId, cannot inject")
+            Log.i(TAG, "no bridge for dialogId=$dialogId (last=$lastDialogId), cannot inject")
             return
         }
         val method = sendStreamDataMethod
@@ -2189,7 +2178,7 @@ class HookEntry : IXposedHookLoadPackage {
 
         // RN 的 JS 侧还没 ready 的话,现在发过去等于石沉大海。
         // 先不标记 injected,等 rnStartReceiveInstruction 回调时会再调一次这里。
-        val ready = isRnFrontReady(dialogId)
+        val ready = isRnFrontReady(dialogId) || isRnFrontReady(lastDialogId)
         if (ready == false) {
             Log.i(TAG, "RN front not ready yet, defer inject dialogId=$dialogId")
             return
@@ -2259,22 +2248,28 @@ class HookEntry : IXposedHookLoadPackage {
             try {
                 val card = s.cardRef?.get()
                 if (card != null) {
-                    val p1 = card.javaClass.getDeclaredMethod("p1", JSONObject::class.java)
-                    p1.isAccessible = true
-                    val plain = answer.replace("**", "").replace("`", "")
-                    val obj = JSONObject().apply {
-                        put("totalText", plain)
-                        put("isLlmContentDisplayComplete", true)
-                        put("isIllegalContent", false)
+                    val targetMethod = card.javaClass.declaredMethods.firstOrNull { m ->
+                        m.parameterTypes.size == 1 && m.parameterTypes[0] == JSONObject::class.java
                     }
-                    p1.invoke(card, obj)
-                    Log.i(TAG, "synced authoritative text via p1(totalText) dialogId=$dialogId")
+                    if (targetMethod != null) {
+                        targetMethod.isAccessible = true
+                        val plain = answer.replace("**", "").replace("`", "")
+                        val obj = JSONObject().apply {
+                            put("totalText", plain)
+                            put("isLlmContentDisplayComplete", true)
+                            put("isIllegalContent", false)
+                        }
+                        targetMethod.invoke(card, obj)
+                        Log.i(TAG, "synced authoritative text via ${targetMethod.name}(totalText) dialogId=$dialogId")
+                    } else {
+                        Log.i(TAG, "no totalText sync method found on card class ${card.javaClass.name}")
+                    }
                 } else {
                     // 没拿到卡不影响显示(那条走 bridge),只是复制/重播读到的还是小爱的话。
-                    Log.i(TAG, "no RN card for p1(totalText) dialogId=$dialogId")
+                    Log.i(TAG, "no RN card for authoritative text dialogId=$dialogId")
                 }
             } catch (t: Throwable) {
-                Log.i(TAG, "p1() render failed dialogId=$dialogId: $t")
+                Log.i(TAG, "authoritative text render failed dialogId=$dialogId: $t")
             }
         }
     }

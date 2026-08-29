@@ -8,22 +8,22 @@ import org.json.JSONObject
  */
 data class TargetSymbols(
     var operationManagerClass: String = "com.xiaomi.voiceassistant.instruction.base.OperationManager",
-    var rnCardClass: String = "com.xiaomi.voiceassistant.instruction.card.TemplateReactNativeCard",
-    var bridgeClass: String = "r70.a",
-    var audioTrackManagerClass: String = "v20.e",
-    var toastStreamPlayerClass: String = "la0.n1",
-    var ttsBridgeClass: String = "com.xiaomi.voiceassistant.u1",
-    var asrProcessorClass: String = "z10.a",
-    var agentActionClass: String = "kh0.s0",
-    var toastOperationClass: String = "jb0.vd",
+    var rnCardClass: String = "com.xiaomi.voiceassistant.instruction.card.b",
+    var bridgeClass: String = "ic1.a",
+    var audioTrackManagerClass: String = "s51.f",
+    var toastStreamPlayerClass: String = "wf1.v1",
+    var ttsBridgeClass: String = "com.xiaomi.voiceassistant.l2",
+    var asrProcessorClass: String = "q41.c",
+    var agentActionClass: String = "eo1.w0",
+    var toastOperationClass: String = "c41.y1",
     var uiNavOperationClass: String = "jb0.ue",
-    var speakContentClass: String = "com.xiaomi.voiceassistant.instruction.utils.b2",
+    var speakContentClass: String = "com.xiaomi.voiceassistant.instruction.utils.x2",
     var intentUtilsWrapperClass: String = "com.xiaomi.voiceassistant.instruction.utils.IntentUtilsWrapper",
-    var intentUtilsClass: String = "com.xiaomi.voiceassistant.utils.m2",
+    var intentUtilsClass: String = "com.xiaomi.voiceassistant.utils.t2",
     var chatDbManagerClass: String = "com.xiaomi.voiceassistant.skills.model.chat.a",
-    var flowToastCardClass: String = "com.xiaomi.voiceassistant.instruction.card.stream.FlowTemplateToastCard",
-    var flowControllerClass: String = "com.xiaomi.voiceassistant.mainui.flowableresult.d",
-    var floatManagerClass: String = "com.xiaomi.voiceassistant.widget.d"
+    var flowToastCardClass: String = "com.xiaomi.voiceassistant.instruction.card.stream.b",
+    var flowControllerClass: String = "dl1.r0",
+    var floatManagerClass: String = "sl1.t0"
 ) {
 
     fun toJson(): JSONObject = JSONObject().apply {
