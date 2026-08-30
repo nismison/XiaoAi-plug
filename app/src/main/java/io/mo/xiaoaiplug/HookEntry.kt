@@ -373,6 +373,7 @@ class HookEntry : IXposedHookLoadPackage {
         hookBridge(lpparam.classLoader)
         hookCardBaseDiagnostic(lpparam.classLoader)
         hookSettingsJump(lpparam.classLoader)
+        hookDismissLifecycle(lpparam.classLoader)
         hookWebSearchFallback(lpparam.classLoader)
         hookChatHistory(lpparam.classLoader)
         hookCardSinks(lpparam.classLoader)
@@ -384,9 +385,9 @@ class HookEntry : IXposedHookLoadPackage {
         hookBackgroundAppsNav(lpparam.classLoader)
     }
 
-    // 「查看类」不跳转:拦截 IntentUtilsWrapper.startActivitySafely(Intent, boolean)。
-    // 当最近一次问话是"查看/查询…"类、且没有放行词、且跳转目标确实是系统设置页时,
-    // 直接跳过原方法(装作启动成功),这样小爱就不会跳进设置。
+    // 「查看类」不跳转:拦截 IntentUtilsWrapper 的所有跳转与隐藏卡片入口。
+    // 当最近一次问话是"查看/查询/多少…"类、且没有放行词时,在小爱收回对话框前直接拦截,
+    // 保持浮窗卡片展开并转由 AI 接管回答。
     private fun hookSettingsJump(cl: ClassLoader) {
         val clazz = try {
             cl.loadClass(symbols.intentUtilsWrapperClass)
@@ -394,33 +395,83 @@ class HookEntry : IXposedHookLoadPackage {
             Log.i(TAG, "${symbols.intentUtilsWrapperClass} not found: $e")
             return
         }
+        val targetNames = setOf(
+            "startActivitySafely",
+            "startActivityHideCard",
+            "startActivityHideCardByWindow",
+            "startActivityHideCardByActivity",
+            "startActivityNotHandleBoard",
+            "sendIntentHideCard",
+            "startActivityWithIntent",
+            "b",
+            "c",
+            "d"
+        )
         for (m in clazz.declaredMethods) {
-            if (m.name != "startActivitySafely") continue
+            if (m.name !in targetNames) continue
             val types = m.parameterTypes
-            if (types.isEmpty() || types[0] != android.content.Intent::class.java) continue
+            if (types.isEmpty()) continue
             try {
                 XposedBridge.hookMethod(m, object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         try {
-                            val intent = param.args[0] as? android.content.Intent ?: return
                             if (!ownsCurrentTurn()) return
-                            Log.i(TAG, "block view-jump: query=\"$lastQueryText\" intent=$intent")
-                            // 返回类型可能是 boolean/int,给个"成功"值,避免上层误判失败
+                            Log.i(TAG, "block view-jump via IntentUtilsWrapper.${m.name}: query=\"$lastQueryText\"")
                             param.result = when (m.returnType) {
                                 java.lang.Boolean.TYPE -> true
                                 Integer.TYPE -> 0
                                 else -> null
                             }
-                            // 第二层:静音那句"好的",并尝试自建卡片让 AI 来回答
                             onViewJumpBlocked(lastDialogId)
                         } catch (t: Throwable) {
                             Log.i(TAG, "hookSettingsJump error: $t")
                         }
                     }
                 })
-                Log.i(TAG, "hooked IntentUtilsWrapper.startActivitySafely(${types.joinToString { it.simpleName }})")
+                Log.i(TAG, "hooked IntentUtilsWrapper.${m.name}(${types.joinToString { it.simpleName }})")
             } catch (t: Throwable) {
-                Log.i(TAG, "hook startActivitySafely fail: $t")
+                Log.i(TAG, "hook IntentUtilsWrapper.${m.name} fail: $t")
+            }
+        }
+    }
+
+    // 监听浮窗/主界面关闭与退出事件:当用户返回桌面、关闭浮窗或切走时,立即停止 TTS 播报(对齐小爱原生)
+    private fun hookDismissLifecycle(cl: ClassLoader) {
+        val floatManagerClass = try {
+            cl.loadClass(symbols.floatManagerClass)
+        } catch (t: Throwable) { null }
+        if (floatManagerClass != null) {
+            for (m in floatManagerClass.declaredMethods) {
+                if (m.name in listOf("hideFloatCard", "resetUiStateAsCapsuleShow")) {
+                    try {
+                        XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                            override fun afterHookedMethod(param: MethodHookParam) {
+                                Log.i(TAG, "[float] dismissed (${m.name}), stopping TTS")
+                                stopOurTts()
+                            }
+                        })
+                        Log.i(TAG, "hooked floatManager.${m.name} for dismiss TTS stop")
+                    } catch (t: Throwable) { }
+                }
+            }
+        }
+
+        val uiManagerClass = try {
+            cl.loadClass("com.xiaomi.voiceassistant.UiManager")
+        } catch (t: Throwable) { null }
+        if (uiManagerClass != null) {
+            for (m in uiManagerClass.declaredMethods) {
+                if (m.name in listOf("moveTabHostMainActivityToBackground", "onStopEngine", "resetUiStateAsCapsuleShow")) {
+                    try {
+                        XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                            override fun afterHookedMethod(param: MethodHookParam) {
+                                Log.i(TAG, "[ui] exit (${m.name}), stopping TTS")
+                                stopOurTts()
+                            }
+                        })
+                        Log.i(TAG, "hooked UiManager.${m.name} for dismiss TTS stop")
+                    } catch (t: Throwable) { }
+                }
             }
         }
     }
@@ -1622,7 +1673,7 @@ class HookEntry : IXposedHookLoadPackage {
         Log.i(TAG, "hooked ${symbols.operationManagerClass}.setQueryInfo")
     }
 
-    // 记录 TemplateReactNativeCard 实例(按 dialogId),以便接管时能强制显示卡片
+    // 记录 TemplateReactNativeCard 实例(按 dialogId),并在卡片隐藏/销毁/离开前台时及时停播 TTS
     private fun hookRnCard(cl: ClassLoader) {
         val clazz = try {
             cl.loadClass(symbols.rnCardClass)
@@ -1630,7 +1681,7 @@ class HookEntry : IXposedHookLoadPackage {
             Log.i(TAG, "${symbols.rnCardClass} not found: $e")
             return
         }
-        for (name in listOf("bindView", "onCardAttached")) {
+        for (name in listOf("bindView", "onCardAttached", "onCardInvisible", "onCardDetached", "onCardRemoved", "onDestroy")) {
             for (m in clazz.declaredMethods) {
                 if (m.name == name) {
                     try {
@@ -1638,6 +1689,11 @@ class HookEntry : IXposedHookLoadPackage {
                             override fun afterHookedMethod(param: MethodHookParam) {
                                 try {
                                     val card = param.thisObject
+                                    if (name in listOf("onCardInvisible", "onCardDetached", "onCardRemoved", "onDestroy")) {
+                                        Log.i(TAG, "[rn] card exit/invisible ($name), stopping TTS")
+                                        stopOurTts()
+                                        return
+                                    }
                                     val getDialogId = card.javaClass.getMethod("getDialogId")
                                     val dialogId = getDialogId.invoke(card) as? String ?: return
                                     if (dialogId.isNotBlank()) {
@@ -1656,7 +1712,6 @@ class HookEntry : IXposedHookLoadPackage {
                 }
             }
         }
-
     }
 
     // 拦截 RN 桥接的 sendStreamData(type, content):
@@ -1883,6 +1938,45 @@ class HookEntry : IXposedHookLoadPackage {
             Log.i(TAG, "speak content synced dialogId=$dialogId")
         } catch (t: Throwable) {
             Log.i(TAG, "syncSpeakContent failed dialogId=$dialogId: $t")
+        }
+    }
+
+    // 当用户返回桌面、关闭浮窗或卡片被移出屏幕时,立即终止 TTS 播报(对齐小爱原生行为)
+    private fun stopOurTts() {
+        try {
+            val cl = targetClassLoader ?: return
+            // 1. 停止大模型专属 ToastStreamPlayer (wf1.v1)
+            try {
+                val clazz = cl.loadClass(symbols.toastStreamPlayerClass)
+                kotlinObjectInstance(clazz)?.let { instance ->
+                    clazz.getMethod("stopPlay").invoke(instance)
+                    Log.i(TAG, "stopped ToastStreamPlayer TTS")
+                }
+            } catch (t: Throwable) { }
+
+            // 2. 停止备用 TTS 引擎 (com.xiaomi.voiceassistant.l2)
+            try {
+                val ttsClazz = cl.loadClass(symbols.ttsBridgeClass)
+                val instance = ttsClazz.getMethod("getInstance").invoke(null)
+                if (instance != null) {
+                    for (m in listOf("stop", "stopPlay", "stopSpeak")) {
+                        try {
+                            ttsClazz.getMethod(m).invoke(instance)
+                        } catch (t: Throwable) { }
+                    }
+                }
+            } catch (t: Throwable) { }
+
+            // 3. 停止所有音轨播放 (含 toastStreamTts)
+            try {
+                val trackClazz = cl.loadClass(symbols.audioTrackManagerClass)
+                val tracks = allAudioTracks(trackClazz)
+                for ((_, track) in tracks) {
+                    stopTrack(track)
+                }
+            } catch (t: Throwable) { }
+        } catch (t: Throwable) {
+            Log.i(TAG, "stopOurTts error: $t")
         }
     }
 
