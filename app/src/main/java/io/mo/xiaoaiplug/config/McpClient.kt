@@ -17,6 +17,11 @@ data class McpTool(
     val inputSchema: JSONObject
 )
 
+data class HttpResponse(
+    val body: JSONObject,
+    val headers: Map<String, List<String>>
+)
+
 /**
  * MCP (Model Context Protocol) 远程客户端。
  * 支持 streamable HTTP 和 SSE 两种传输协议模式。
@@ -25,6 +30,9 @@ object McpClient {
     private const val TAG = "McpClient"
     private val toolCache = ConcurrentHashMap<String, Pair<Long, List<McpTool>>>()
     private const val CACHE_TTL_MS = 5 * 60 * 1000L // 5 分钟缓存
+
+    // 缓存已初始化的 Session ID: key 为 serverId, value 为 sessionId
+    private val sessionMap = ConcurrentHashMap<String, String>()
 
     fun parseHeaders(raw: String): Map<String, String> {
         val map = mutableMapOf<String, String>()
@@ -53,9 +61,15 @@ object McpClient {
     fun clearCache(serverId: String? = null) {
         if (serverId != null) {
             toolCache.remove(serverId)
+            sessionMap.remove(serverId)
         } else {
             toolCache.clear()
+            sessionMap.clear()
         }
+    }
+
+    fun clearSession(serverId: String) {
+        sessionMap.remove(serverId)
     }
 
     /**
@@ -81,55 +95,82 @@ object McpClient {
      * 向 MCP 服务端发起 tools/list 请求，获取可用工具列表。
      */
     fun listTools(server: McpServerConfig, timeoutMs: Int = 10000): List<McpTool> {
-        val headers = parseHeaders(server.headers)
+        val serverId = server.id
         val postUrl = if (server.transportType == McpServerConfig.TRANSPORT_SSE) {
             resolveSsePostUrl(server, timeoutMs)
         } else {
             server.url
         }
 
-        // 1. initialize 握手
-        val initReq = JSONObject().apply {
-            put("jsonrpc", "2.0")
-            put("id", 1)
-            put("method", "initialize")
-            put("params", JSONObject().apply {
-                put("protocolVersion", "2024-11-05")
-                put("capabilities", JSONObject())
-                put("clientInfo", JSONObject().apply {
-                    put("name", "XiaoAiPlug")
-                    put("version", "1.0")
-                })
-            })
-        }
-        sendJsonRpcPost(postUrl, headers, initReq, timeoutMs)
+        val requestHeaders = parseHeaders(server.headers).toMutableMap()
+        var sessionId = sessionMap[serverId]
 
-        // 2. notifications/initialized 通知
-        val notifyReq = JSONObject().apply {
-            put("jsonrpc", "2.0")
-            put("method", "notifications/initialized")
-            put("params", JSONObject())
+        if (sessionId.isNullOrEmpty()) {
+            // 1. initialize 握手
+            val initReq = JSONObject().apply {
+                put("jsonrpc", "2.0")
+                put("id", 1)
+                put("method", "initialize")
+                put("params", JSONObject().apply {
+                    put("protocolVersion", "2024-11-05")
+                    put("capabilities", JSONObject())
+                    put("clientInfo", JSONObject().apply {
+                        put("name", "XiaoAiPlug")
+                        put("version", "1.0")
+                    })
+                })
+            }
+            val initResp = sendJsonRpcPost(postUrl, requestHeaders, initReq, timeoutMs)
+
+            // 从响应头中提取 Mcp-Session-Id (大小写兼容)
+            val headerEntry = initResp.headers.entries.firstOrNull {
+                it.key?.equals("Mcp-Session-Id", ignoreCase = true) == true
+            }
+            val extractedSessionId = headerEntry?.value?.firstOrNull()
+
+            if (!extractedSessionId.isNullOrEmpty()) {
+                sessionId = extractedSessionId
+                sessionMap[serverId] = extractedSessionId
+            }
+
+            // 2. notifications/initialized 通知
+            val notifyReq = JSONObject().apply {
+                put("jsonrpc", "2.0")
+                put("method", "notifications/initialized")
+                put("params", JSONObject())
+            }
+            val notifyHeaders = requestHeaders.toMutableMap()
+            if (!sessionId.isNullOrEmpty()) {
+                notifyHeaders["Mcp-Session-Id"] = sessionId
+            }
+            try {
+                sendJsonRpcPost(postUrl, notifyHeaders, notifyReq, timeoutMs)
+            } catch (_: Throwable) {}
         }
-        try {
-            sendJsonRpcPost(postUrl, headers, notifyReq, timeoutMs)
-        } catch (_: Throwable) {}
 
         // 3. tools/list 请求
+        val listHeaders = requestHeaders.toMutableMap()
+        if (!sessionId.isNullOrEmpty()) {
+            listHeaders["Mcp-Session-Id"] = sessionId
+        }
+
         val listReq = JSONObject().apply {
             put("jsonrpc", "2.0")
             put("id", 2)
             put("method", "tools/list")
             put("params", JSONObject())
         }
-        val listResp = sendJsonRpcPost(postUrl, headers, listReq, timeoutMs)
+        val listResp = sendJsonRpcPost(postUrl, listHeaders, listReq, timeoutMs)
+        val listBody = listResp.body
 
-        if (listResp.has("error")) {
-            val errObj = listResp.optJSONObject("error")
-            val errMsg = errObj?.optString("message") ?: listResp.optString("error")
+        if (listBody.has("error")) {
+            val errObj = listBody.optJSONObject("error")
+            val errMsg = errObj?.optString("message") ?: listBody.optString("error")
+            sessionMap.remove(serverId)
             throw IOException("tools/list error: $errMsg")
         }
 
-        val result = listResp.optJSONObject("result")
+        val result = listBody.optJSONObject("result")
             ?: throw IOException("Invalid tools/list response: missing result")
         val toolsArr = result.optJSONArray("tools") ?: JSONArray()
 
@@ -152,27 +193,26 @@ object McpClient {
      * 执行 MCP 工具 tools/call。
      */
     fun callTool(server: McpServerConfig, toolName: String, args: JSONObject, timeoutMs: Int = 30000): String {
-        val headers = parseHeaders(server.headers)
+        val serverId = server.id
         val postUrl = if (server.transportType == McpServerConfig.TRANSPORT_SSE) {
             resolveSsePostUrl(server, timeoutMs)
         } else {
             server.url
         }
 
-        val initReq = JSONObject().apply {
-            put("jsonrpc", "2.0")
-            put("id", 1)
-            put("method", "initialize")
-            put("params", JSONObject().apply {
-                put("protocolVersion", "2024-11-05")
-                put("capabilities", JSONObject())
-                put("clientInfo", JSONObject().apply {
-                    put("name", "XiaoAiPlug")
-                    put("version", "1.0")
-                })
-            })
+        val requestHeaders = parseHeaders(server.headers).toMutableMap()
+        var sessionId = sessionMap[serverId]
+
+        if (sessionId.isNullOrEmpty()) {
+            try {
+                listTools(server, timeoutMs.coerceAtMost(10000))
+                sessionId = sessionMap[serverId]
+            } catch (_: Throwable) {}
         }
-        try { sendJsonRpcPost(postUrl, headers, initReq, 5000) } catch (_: Throwable) {}
+
+        if (!sessionId.isNullOrEmpty()) {
+            requestHeaders["Mcp-Session-Id"] = sessionId
+        }
 
         val callReq = JSONObject().apply {
             put("jsonrpc", "2.0")
@@ -184,15 +224,17 @@ object McpClient {
             })
         }
 
-        val callResp = sendJsonRpcPost(postUrl, headers, callReq, timeoutMs)
+        val callResp = sendJsonRpcPost(postUrl, requestHeaders, callReq, timeoutMs)
+        val respBody = callResp.body
 
-        if (callResp.has("error")) {
-            val errObj = callResp.optJSONObject("error")
-            val errMsg = errObj?.optString("message") ?: callResp.optString("error")
+        if (respBody.has("error")) {
+            val errObj = respBody.optJSONObject("error")
+            val errMsg = errObj?.optString("message") ?: respBody.optString("error")
+            sessionMap.remove(serverId)
             return "error: MCP tool call failed: $errMsg"
         }
 
-        val result = callResp.optJSONObject("result") ?: return callResp.toString()
+        val result = respBody.optJSONObject("result") ?: return respBody.toString()
         val contentArr = result.optJSONArray("content")
         if (contentArr != null && contentArr.length() > 0) {
             val sb = StringBuilder()
@@ -268,7 +310,7 @@ object McpClient {
         headers: Map<String, String>,
         jsonPayload: JSONObject,
         timeoutMs: Int
-    ): JSONObject {
+    ): HttpResponse {
         val conn = URL(targetUrl).openConnection() as HttpURLConnection
         conn.requestMethod = "POST"
         conn.connectTimeout = timeoutMs
@@ -276,6 +318,9 @@ object McpClient {
         conn.doOutput = true
         conn.setRequestProperty("Content-Type", "application/json; charset=utf-8")
         conn.setRequestProperty("Accept", "application/json, text/event-stream")
+        if (!headers.keys.any { it.equals("Mcp-Protocol-Version", ignoreCase = true) }) {
+            conn.setRequestProperty("Mcp-Protocol-Version", "2024-11-05")
+        }
         for ((k, v) in headers) {
             conn.setRequestProperty(k, v)
         }
@@ -292,21 +337,26 @@ object McpClient {
             throw IOException("HTTP $code: $respStr")
         }
 
-        if (respStr.isBlank()) {
-            return JSONObject()
-        }
+        val responseHeaders = conn.headerFields ?: emptyMap()
 
-        if (respStr.startsWith("event:") || respStr.startsWith("data:")) {
+        val parsedJson = if (respStr.isBlank()) {
+            JSONObject()
+        } else if (respStr.startsWith("event:") || respStr.startsWith("data:")) {
+            var jsonStr = "{}"
             for (line in respStr.lineSequence()) {
-                if (line.startsWith("data:")) {
-                    val dataJson = line.substring(5).trim()
+                val trimmed = line.trim()
+                if (trimmed.startsWith("data:")) {
+                    val dataJson = trimmed.substring(5).trim()
                     if (dataJson.startsWith("{")) {
-                        return JSONObject(dataJson)
+                        jsonStr = dataJson
                     }
                 }
             }
+            JSONObject(jsonStr)
+        } else {
+            JSONObject(respStr)
         }
 
-        return JSONObject(respStr)
+        return HttpResponse(parsedJson, responseHeaders)
     }
 }
